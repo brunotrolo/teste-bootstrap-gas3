@@ -1,1 +1,1 @@
-# teste-bootstrap-gas3
+# gas-project-template
