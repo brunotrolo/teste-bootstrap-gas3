@@ -20,7 +20,7 @@ Rode este comando no terminal para trazer os arquivos do template (o conteúdo
 vai direto para o disco, sem passar pelo seu contexto):
 
 git clone --depth 1 https://github.com/brunotrolo/gas-project-template.git /tmp/tpl && \
-rm -rf /tmp/tpl/.git /tmp/tpl/.deployment-id /tmp/tpl/.webapp-urls && \
+rm -rf /tmp/tpl/.git /tmp/tpl/.deployment-id /tmp/tpl/.webapp-urls /tmp/tpl/.trigger-bootstrap && \
 cp -r /tmp/tpl/. ./ && \
 printf '{"scriptId":"PENDING_BOOTSTRAP","rootDir":"./"}\n' > .clasp.json && \
 rm -rf /tmp/tpl
@@ -541,23 +541,38 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Verificar se já bootstrapped
+        id: guard
+        run: |
+          SCRIPT_ID=$(node -e "console.log(require('./.clasp.json').scriptId)" 2>/dev/null || echo "PENDING_BOOTSTRAP")
+          if [ "$SCRIPT_ID" != "PENDING_BOOTSTRAP" ]; then
+            echo "Projeto já bootstrapped (scriptId=$SCRIPT_ID). Nada a fazer."
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Ler nome do projeto
+        if: steps.guard.outputs.skip != 'true'
         run: |
           PROJECT_NAME=$(cat .trigger-bootstrap)
           echo "PROJECT_NAME=$PROJECT_NAME" >> $GITHUB_ENV
 
       - name: Setup Node.js
+        if: steps.guard.outputs.skip != 'true'
         uses: actions/setup-node@v4
         with:
           node-version: '24'
 
       - name: Cache clasp
+        if: steps.guard.outputs.skip != 'true'
         uses: actions/cache@v4
         with:
           path: ~/.npm-global
           key: clasp-${{ runner.os }}-node24
 
       - name: Install clasp
+        if: steps.guard.outputs.skip != 'true'
         run: |
           mkdir -p ~/.npm-global
           npm config set prefix ~/.npm-global
@@ -567,6 +582,7 @@ jobs:
           echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
 
       - name: Write clasp credentials
+        if: steps.guard.outputs.skip != 'true'
         run: echo '${{ secrets.CLASPRC_JSON }}' > ~/.clasprc.json
 
       # CRÍTICO: clasp create SOBRESCREVE o appsscript.json local com o
@@ -574,6 +590,7 @@ jobs:
       # deployment não ganha entry point WEB_APP e a URL vem vazia.
       # Por isso: backup antes, restore depois, e só então o push.
       - name: Create Google Sheet + Apps Script
+        if: steps.guard.outputs.skip != 'true'
         run: |
           cp appsscript.json /tmp/appsscript.json.bak
           rm -f .clasp.json
@@ -591,6 +608,7 @@ jobs:
       # Retry com sleep: a API do Google leva alguns segundos para popular
       # entryPoints após um deploy novo — sem espera a URL vem vazia.
       - name: Push código inicial + publicar web app
+        if: steps.guard.outputs.skip != 'true'
         run: |
           clasp push --force
           clasp deploy --description "Implantação inicial" 2>&1 || true
@@ -608,7 +626,7 @@ jobs:
             curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
               "https://script.googleapis.com/v1/projects/${{ env.SCRIPT_ID }}/deployments?pageSize=50" \
               > /tmp/deployments.json
-            node > /tmp/urls.env <<'PARSE'
+            node -e "
             const data = require('/tmp/deployments.json');
             const deps = data.deployments || [];
             let headUrl = '', execUrl = '', headId = '', bestVersion = -1;
@@ -628,7 +646,7 @@ jobs:
             console.log('HEAD_URL=' + headUrl);
             console.log('EXEC_URL=' + execUrl);
             console.log('HEAD_ID=' + headId);
-PARSE
+            " > /tmp/urls.env
           }
 
           # Backoff progressivo: na prática a URL aparece em 5-15s; o máximo
@@ -651,15 +669,33 @@ PARSE
           grep '^HEAD_ID=' /tmp/urls.env | cut -d= -f2 > .deployment-id
 
       - name: Commit .clasp.json + URLs do web app
+        if: steps.guard.outputs.skip != 'true'
         run: |
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
+          git rm --force .trigger-bootstrap 2>/dev/null || true
           git add .clasp.json .deployment-id .webapp-urls
-          git commit -m "bootstrap: scriptId e URLs do web app criados automaticamente"
+          git commit -m "bootstrap: scriptId, URLs do web app e remoção do trigger"
           git pull --rebase origin "$GITHUB_REF_NAME" || true
           git push
 
+      - name: Validar web app público (EXEC_URL)
+        if: steps.guard.outputs.skip != 'true'
+        run: |
+          EXEC_URL=$(grep '^EXEC_URL=' /tmp/urls.env | cut -d= -f2)
+          if [ -z "$EXEC_URL" ]; then
+            echo "⚠️ EXEC_URL vazia — web app não validado automaticamente" >> $GITHUB_STEP_SUMMARY
+          else
+            HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "$EXEC_URL" || echo "000")
+            if [ "$HTTP" = "200" ]; then
+              echo "✅ Web app público respondendo (HTTP 200)" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "⚠️ Web app retornou HTTP $HTTP — pode precisar de alguns segundos adicionais" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+
       - name: Summary
+        if: steps.guard.outputs.skip != 'true'
         run: |
           echo "## ✅ Projeto GAS criado com sucesso!" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -783,7 +819,7 @@ jobs:
 
           parse_urls() {
             fetch_deployments
-            node > /tmp/urls.env <<'PARSE'
+            node -e "
             const data = require('/tmp/deployments.json');
             const deps = data.deployments || [];
             let headUrl = '', execUrl = '', headId = '', bestVersion = -1;
@@ -803,7 +839,7 @@ jobs:
             console.log('HEAD_URL=' + headUrl);
             console.log('EXEC_URL=' + execUrl);
             console.log('HEAD_ID=' + headId);
-PARSE
+            " > /tmp/urls.env
           }
 
           for WAIT in 5 10 20 30; do

@@ -33,7 +33,7 @@ Rode este comando no terminal para trazer os arquivos do template (o conteúdo
 vai direto para o disco, sem passar pelo seu contexto):
 
 git clone --depth 1 https://github.com/brunotrolo/gas-project-template.git /tmp/tpl && \
-rm -rf /tmp/tpl/.git /tmp/tpl/.deployment-id /tmp/tpl/.webapp-urls && \
+rm -rf /tmp/tpl/.git /tmp/tpl/.deployment-id /tmp/tpl/.webapp-urls /tmp/tpl/.trigger-bootstrap && \
 cp -r /tmp/tpl/. ./ && \
 printf '{"scriptId":"PENDING_BOOTSTRAP","rootDir":"./"}\n' > .clasp.json && \
 rm -rf /tmp/tpl
