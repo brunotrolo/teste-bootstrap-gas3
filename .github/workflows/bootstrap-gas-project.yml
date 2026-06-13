@@ -1,0 +1,156 @@
+name: Bootstrap GAS Project
+
+# Workflow executado UMA ÚNICA VEZ para criar a planilha Google e o
+# projeto Apps Script automaticamente.
+#
+# Gatilho: push do arquivo .trigger-bootstrap (criado pelo Claude Code).
+# Isso evita depender de workflow_dispatch, que exige permissão extra.
+
+on:
+  push:
+    paths:
+      - '.trigger-bootstrap'
+    branches:
+      - '**'
+
+permissions:
+  contents: write
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ler nome do projeto
+        run: |
+          PROJECT_NAME=$(cat .trigger-bootstrap)
+          echo "PROJECT_NAME=$PROJECT_NAME" >> $GITHUB_ENV
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Cache clasp
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm-global
+          key: clasp-${{ runner.os }}-node24
+
+      - name: Install clasp
+        run: |
+          mkdir -p ~/.npm-global
+          npm config set prefix ~/.npm-global
+          if [ ! -f ~/.npm-global/bin/clasp ]; then
+            npm install -g @google/clasp
+          fi
+          echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
+
+      - name: Write clasp credentials
+        run: echo '${{ secrets.CLASPRC_JSON }}' > ~/.clasprc.json
+
+      # CRÍTICO: clasp create SOBRESCREVE o appsscript.json local com o
+      # manifest padrão do Google (sem a seção webapp). Sem essa seção o
+      # deployment não ganha entry point WEB_APP e a URL vem vazia.
+      # Por isso: backup antes, restore depois, e só então o push.
+      - name: Create Google Sheet + Apps Script
+        run: |
+          cp appsscript.json /tmp/appsscript.json.bak
+          rm -f .clasp.json
+          clasp create --type sheets --title "${{ env.PROJECT_NAME }}"
+          cp /tmp/appsscript.json.bak appsscript.json
+          rm -f Code.js Code.gs   # arquivos padrão que o clasp create pode trazer
+          SCRIPT_ID=$(node -e "console.log(require('./.clasp.json').scriptId)")
+          SHEET_ID=$(node -e "const c=require('./.clasp.json'); console.log(c.parentId ? (Array.isArray(c.parentId) ? c.parentId[0] : c.parentId) : 'N/A')")
+          echo "SCRIPT_ID=$SCRIPT_ID" >> $GITHUB_ENV
+          echo "SHEET_ID=$SHEET_ID" >> $GITHUB_ENV
+
+      # Publica o web app e captura as URLs REAIS direto da API do Apps Script.
+      # Nunca monte a URL na mão: a API retorna entryPoints[].webApp.url e essa
+      # é a URL exata que funciona no browser.
+      # Retry com sleep: a API do Google leva alguns segundos para popular
+      # entryPoints após um deploy novo — sem espera a URL vem vazia.
+      - name: Push código inicial + publicar web app
+        run: |
+          clasp push --force
+          clasp deploy --description "Implantação inicial" 2>&1 || true
+
+          # Renova o access token a partir do refresh token (mesmas credenciais do clasp)
+          CLIENT_ID=$(node -e "console.log(require(process.env.HOME+'/.clasprc.json').oauth2ClientSettings.clientId)")
+          CLIENT_SECRET=$(node -e "console.log(require(process.env.HOME+'/.clasprc.json').oauth2ClientSettings.clientSecret)")
+          REFRESH_TOKEN=$(node -e "console.log(require(process.env.HOME+'/.clasprc.json').token.refresh_token)")
+          ACCESS_TOKEN=$(curl -s https://oauth2.googleapis.com/token \
+            -d client_id="$CLIENT_ID" -d client_secret="$CLIENT_SECRET" \
+            -d refresh_token="$REFRESH_TOKEN" -d grant_type=refresh_token \
+            | node -e "let r='';process.stdin.on('data',d=>r+=d);process.stdin.on('end',()=>console.log(JSON.parse(r).access_token||''))")
+
+          parse_urls() {
+            curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
+              "https://script.googleapis.com/v1/projects/${{ env.SCRIPT_ID }}/deployments?pageSize=50" \
+              > /tmp/deployments.json
+            node > /tmp/urls.env <<'PARSE'
+            const data = require('/tmp/deployments.json');
+            const deps = data.deployments || [];
+            let headUrl = '', execUrl = '', headId = '', bestVersion = -1;
+            for (const d of deps) {
+              const isHead = !(d.deploymentConfig && d.deploymentConfig.versionNumber);
+              if (isHead && !headId) headId = d.deploymentId;
+              for (const ep of (d.entryPoints || [])) {
+                if (ep.entryPointType === 'WEB_APP' && ep.webApp && ep.webApp.url) {
+                  if (isHead) { headUrl = ep.webApp.url; headId = d.deploymentId; }
+                  else {
+                    const v = Number(d.deploymentConfig.versionNumber) || 0;
+                    if (v > bestVersion) { bestVersion = v; execUrl = ep.webApp.url; }
+                  }
+                }
+              }
+            }
+            console.log('HEAD_URL=' + headUrl);
+            console.log('EXEC_URL=' + execUrl);
+            console.log('HEAD_ID=' + headId);
+          PARSE
+          }
+
+          # Backoff progressivo: na prática a URL aparece em 5-15s; o máximo
+          # (5+10+20+30=65s de espera) cobre os casos lentos da API do Google
+          for WAIT in 5 10 20 30; do
+            parse_urls
+            HEAD_URL_VAL=$(grep '^HEAD_URL=' /tmp/urls.env | cut -d= -f2)
+            EXEC_URL_VAL=$(grep '^EXEC_URL=' /tmp/urls.env | cut -d= -f2)
+            if [ -n "$HEAD_URL_VAL" ] && [ -n "$EXEC_URL_VAL" ]; then
+              echo "URLs capturadas"
+              break
+            fi
+            echo "URLs ainda vazias. Aguardando ${WAIT}s..."
+            sleep $WAIT
+          done
+
+          cat /tmp/urls.env
+          cat /tmp/urls.env >> $GITHUB_ENV
+          cp /tmp/urls.env .webapp-urls
+          grep '^HEAD_ID=' /tmp/urls.env | cut -d= -f2 > .deployment-id
+
+      - name: Commit .clasp.json + URLs do web app
+        run: |
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add .clasp.json .deployment-id .webapp-urls
+          git commit -m "bootstrap: scriptId e URLs do web app criados automaticamente"
+          git pull --rebase origin "$GITHUB_REF_NAME" || true
+          git push
+
+      - name: Summary
+        run: |
+          echo "## ✅ Projeto GAS criado com sucesso!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Campo | Link |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| 📊 Planilha Google | https://docs.google.com/spreadsheets/d/${{ env.SHEET_ID }}/edit |" >> $GITHUB_STEP_SUMMARY
+          echo "| ⚙️ Editor GAS | https://script.google.com/home/projects/${{ env.SCRIPT_ID }}/edit |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🟢 Web App DEV (só dono logado) | ${{ env.HEAD_URL }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔵 Web App PROD (público) | ${{ env.EXEC_URL }} |" >> $GITHUB_STEP_SUMMARY

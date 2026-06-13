@@ -1,0 +1,165 @@
+name: Deploy to GAS DEV
+
+# Dispara automaticamente em todo push para main.
+# Aguarda o bootstrap ser concluído antes do primeiro deploy real.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write   # para commitar .webapp-urls atualizados
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verificar se bootstrap foi concluído
+        id: check
+        run: |
+          SCRIPT_ID=$(node -e "console.log(require('./.clasp.json').scriptId)")
+          if [ "$SCRIPT_ID" = "PENDING_BOOTSTRAP" ]; then
+            echo "Bootstrap ainda não concluído. Pulando deploy."
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup Node.js
+        if: steps.check.outputs.skip == 'false'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Cache clasp
+        if: steps.check.outputs.skip == 'false'
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm-global
+          key: clasp-${{ runner.os }}-node24
+
+      - name: Install clasp
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          mkdir -p ~/.npm-global
+          npm config set prefix ~/.npm-global
+          if [ ! -f ~/.npm-global/bin/clasp ]; then
+            npm install -g @google/clasp
+          fi
+          echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
+
+      - name: Write clasp credentials
+        if: steps.check.outputs.skip == 'false'
+        run: echo '${{ secrets.CLASPRC_JSON }}' > ~/.clasprc.json
+
+      - name: Push to GAS DEV
+        if: steps.check.outputs.skip == 'false'
+        id: push
+        run: |
+          OUTPUT=$(clasp push --force 2>&1)
+          echo "$OUTPUT"
+          FILES=$(echo "$OUTPUT" | grep -c '└─' || true)
+          echo "files=$FILES" >> $GITHUB_OUTPUT
+
+      # Atualiza o web app e captura as URLs reais via API.
+      # GAS limita a 20 deployments versionados — por isso REUSA o existente
+      # (clasp deploy -i) em vez de criar um novo a cada push.
+      - name: Atualizar web app e capturar URLs reais
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          CLIENT_ID=$(node -e "console.log(require(process.env.HOME+'/.clasprc.json').oauth2ClientSettings.clientId)")
+          CLIENT_SECRET=$(node -e "console.log(require(process.env.HOME+'/.clasprc.json').oauth2ClientSettings.clientSecret)")
+          REFRESH_TOKEN=$(node -e "console.log(require(process.env.HOME+'/.clasprc.json').token.refresh_token)")
+          ACCESS_TOKEN=$(curl -s https://oauth2.googleapis.com/token \
+            -d client_id="$CLIENT_ID" -d client_secret="$CLIENT_SECRET" \
+            -d refresh_token="$REFRESH_TOKEN" -d grant_type=refresh_token \
+            | node -e "let r='';process.stdin.on('data',d=>r+=d);process.stdin.on('end',()=>console.log(JSON.parse(r).access_token||''))")
+          SCRIPT_ID=$(node -e "console.log(require('./.clasp.json').scriptId)")
+
+          fetch_deployments() {
+            curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
+              "https://script.googleapis.com/v1/projects/$SCRIPT_ID/deployments?pageSize=50" \
+              > /tmp/deployments.json
+          }
+
+          fetch_deployments
+          EXISTING_ID=$(node -e "
+            const deps = require('/tmp/deployments.json').deployments || [];
+            let best = '', bestV = -1;
+            for (const d of deps) {
+              const v = Number(d.deploymentConfig && d.deploymentConfig.versionNumber) || 0;
+              if (v > bestV) { bestV = v; best = d.deploymentId; }
+            }
+            console.log(best);
+          ")
+          if [ -n "$EXISTING_ID" ]; then
+            clasp deploy -i "$EXISTING_ID" --description "Deploy automático $(date +%Y-%m-%d)" 2>&1 || true
+          else
+            clasp deploy --description "Deploy automático $(date +%Y-%m-%d)" 2>&1 || true
+          fi
+
+          parse_urls() {
+            fetch_deployments
+            node > /tmp/urls.env <<'PARSE'
+            const data = require('/tmp/deployments.json');
+            const deps = data.deployments || [];
+            let headUrl = '', execUrl = '', headId = '', bestVersion = -1;
+            for (const d of deps) {
+              const isHead = !(d.deploymentConfig && d.deploymentConfig.versionNumber);
+              if (isHead && !headId) headId = d.deploymentId;
+              for (const ep of (d.entryPoints || [])) {
+                if (ep.entryPointType === 'WEB_APP' && ep.webApp && ep.webApp.url) {
+                  if (isHead) { headUrl = ep.webApp.url; headId = d.deploymentId; }
+                  else {
+                    const v = Number(d.deploymentConfig.versionNumber) || 0;
+                    if (v > bestVersion) { bestVersion = v; execUrl = ep.webApp.url; }
+                  }
+                }
+              }
+            }
+            console.log('HEAD_URL=' + headUrl);
+            console.log('EXEC_URL=' + execUrl);
+            console.log('HEAD_ID=' + headId);
+          PARSE
+          }
+
+          for WAIT in 5 10 20 30; do
+            parse_urls
+            HEAD_URL_VAL=$(grep '^HEAD_URL=' /tmp/urls.env | cut -d= -f2)
+            if [ -n "$HEAD_URL_VAL" ]; then break; fi
+            echo "URLs vazias. Aguardando ${WAIT}s..."
+            sleep $WAIT
+          done
+
+          cat /tmp/urls.env
+          cat /tmp/urls.env >> $GITHUB_ENV
+          cp /tmp/urls.env .webapp-urls
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add .webapp-urls
+          git diff --staged --quiet || git commit -m "ci: atualiza URLs do web app"
+          git pull --rebase origin "$GITHUB_REF_NAME" 2>/dev/null || true
+          git push 2>/dev/null || true
+
+      - name: Deploy summary
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          echo "### ✅ Deploy GAS DEV concluído" >> $GITHUB_STEP_SUMMARY
+          echo "- **Arquivos:** ${{ steps.push.outputs.files }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch:** \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -n "${{ env.HEAD_URL }}" ]; then
+            echo "### 🌐 Web App" >> $GITHUB_STEP_SUMMARY
+            echo "- 🟢 DEV (só dono logado): ${{ env.HEAD_URL }}" >> $GITHUB_STEP_SUMMARY
+            echo "- 🔵 PROD (público): ${{ env.EXEC_URL }}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ⚠️ Web app NÃO implantado — verifique a seção webapp do appsscript.json" >> $GITHUB_STEP_SUMMARY
+          fi

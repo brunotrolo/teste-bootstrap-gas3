@@ -1,0 +1,76 @@
+name: Rename GAS Project
+
+# Renomeia a planilha Google via Sheets API quando Claude cria .trigger-rename.
+# Gatilho: push do arquivo .trigger-rename contendo o nome final desejado.
+# Limitação: o nome no editor GAS não pode ser alterado via API (rename manual).
+
+on:
+  push:
+    paths:
+      - '.trigger-rename'
+    branches:
+      - '**'
+
+permissions:
+  contents: write
+
+jobs:
+  rename:
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Write clasp credentials
+        run: echo '${{ secrets.CLASPRC_JSON }}' > ~/.clasprc.json
+
+      - name: Renomear planilha via Sheets API
+        run: |
+          CLIENT_ID=$(node -e "console.log(require(process.env.HOME+'/.clasprc.json').oauth2ClientSettings.clientId)")
+          CLIENT_SECRET=$(node -e "console.log(require(process.env.HOME+'/.clasprc.json').oauth2ClientSettings.clientSecret)")
+          REFRESH_TOKEN=$(node -e "console.log(require(process.env.HOME+'/.clasprc.json').token.refresh_token)")
+          ACCESS_TOKEN=$(curl -s https://oauth2.googleapis.com/token \
+            -d client_id="$CLIENT_ID" -d client_secret="$CLIENT_SECRET" \
+            -d refresh_token="$REFRESH_TOKEN" -d grant_type=refresh_token \
+            | node -e "let r='';process.stdin.on('data',d=>r+=d);process.stdin.on('end',()=>console.log(JSON.parse(r).access_token||''))")
+          PARENT_ID=$(node -e "const c=require('./.clasp.json'); console.log(Array.isArray(c.parentId)?c.parentId[0]:c.parentId||'')")
+
+          # Usa node para gerar o payload (seguro com nomes que têm acentos ou espaços)
+          node -e "
+            const name = require('fs').readFileSync('.trigger-rename','utf8').trim();
+            const payload = JSON.stringify({requests:[{updateSpreadsheetProperties:{properties:{title:name},fields:'title'}}]});
+            require('fs').writeFileSync('/tmp/rename_payload.json', payload);
+          "
+
+          RESULT=$(curl -s -X POST \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d @/tmp/rename_payload.json \
+            "https://sheets.googleapis.com/v4/spreadsheets/$PARENT_ID:batchUpdate")
+
+          if echo "$RESULT" | node -e "let r='';process.stdin.on('data',d=>r+=d);process.stdin.on('end',()=>{try{const o=JSON.parse(r);process.exit(o.error?1:0)}catch(e){process.exit(1)}})" ; then
+            NOME=$(cat .trigger-rename)
+            echo "✅ Planilha renomeada para: $NOME" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ Falha ao renomear planilha: $RESULT" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # pull --rebase antes do push: o mesmo commit que dispara este workflow
+      # também dispara o deploy, que commita .webapp-urls de volta — sem o
+      # rebase um dos dois pushes falha com "remote contains work you do not have"
+      - name: Remover arquivo de trigger
+        run: |
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git rm .trigger-rename
+          git commit -m "ci: remove trigger de rename após execução"
+          git pull --rebase origin "$GITHUB_REF_NAME" || true
+          git push
